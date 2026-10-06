@@ -16,9 +16,24 @@ function toast(msg, type) {
 async function api(u, method, body) {
   const o = { method: method || 'GET', headers: { 'Content-Type': 'application/json' } };
   if (body) o.body = JSON.stringify(body);
-  const r = await fetch(u, o);
-  const d = await r.json();
-  if (!r.ok) throw new Error(d.error || d.message || 'HTTP ' + r.status);
+  let r;
+  try {
+    r = await fetch(u, o);
+  } catch (e) {
+    throw new Error('网络请求失败: ' + (e && e.message ? e.message : e));
+  }
+  const text = await r.text();
+  let d;
+  try {
+    d = JSON.parse(text);
+  } catch (_) {
+    // 服务端返回了非 JSON（常见于反代返回 HTML 错误页），这里给出可读信息
+    throw new Error('HTTP ' + r.status + ' 返回非 JSON (' + text.length + ' 字节): ' + text.slice(0, 120));
+  }
+  if (!r.ok) {
+    const msg = (d && (d.error || d.message)) || ('HTTP ' + r.status);
+    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+  }
   return d;
 }
 function toggleSidebar() {
@@ -168,7 +183,11 @@ async function fetchDashboard() {
       }
     }
     fetchModels(); fetchDashboardKeys();
-  } catch(e) { const sc = $('statCards'); if(sc) sc.innerHTML = skeletonCards(4); }
+  } catch(e) {
+    // 以前这里只回填骨架屏，出错完全静默 → 页面看着像"加载中"其实早挂了
+    const sc = $('statCards');
+    if (sc) sc.innerHTML = `<div class="col-span-4 p-5 rounded-2xl bg-error/10 border border-error/30 text-error text-body-md">仪表盘加载失败：${esc(e.message)}</div>`;
+  }
 }
 
 async function fetchModels() {
@@ -540,7 +559,7 @@ async function fetchConfig() {
     const s = await api('/api/config');
     const cfg = $('cfgPort'); if(cfg) cfg.value = s.port||'13339';
     const cc = $('cfgConcurrency'); if(cc) cc.value = s.maxActiveKeys||20;
-    const cs = $('cfgSlotCount'); if(cs) cs.value = s.slotCount||3;
+    const cs = $('cfgSlotCount'); if(cs) cs.value = s.slotCount ?? s.slotsPerKey ?? 3;
     const cw = $('cfgWarpMode'); if(cw) cw.value = s.warpMode||'off';
     const cf = $('cfgFallback'); if(cf) cf.value = s.fallbackProxy||'';
     const cr = $('cfgRefreshMs'); if(cr) cr.value = s.proxyRefreshMs||300000;

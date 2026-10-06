@@ -43,6 +43,21 @@ const AUDIT_FILE = path.join(DATA_DIR, 'audit.jsonl');
 const MODELS_CACHE_FILE = path.join(DATA_DIR, 'models_cache.json');
 const SINGBOX_CONFIG_DIR = path.join(process.cwd(), 'singbox');
 const SUBSCRIPTION_FILE = path.join(DATA_DIR, 'subscription.json');
+const RUNTIME_CONFIG_FILE = path.join(DATA_DIR, 'runtime_config.json');
+
+// 运行期可改的配置（面板 /api/config POST 落盘到这里）
+let runtimeConfig: { proxyRefreshMs?: number } = {};
+try {
+  if (fs.existsSync(RUNTIME_CONFIG_FILE)) {
+    runtimeConfig = JSON.parse(fs.readFileSync(RUNTIME_CONFIG_FILE, 'utf-8')) || {};
+  }
+} catch {}
+
+function saveRuntimeConfig() {
+  try {
+    fs.writeFileSync(RUNTIME_CONFIG_FILE, JSON.stringify(runtimeConfig, null, 2), 'utf-8');
+  } catch {}
+}
 
 // ═══════════════════════════════════════════════════════════
 //  常量
@@ -600,13 +615,19 @@ function loadAuditLog() {
 async function fetchModelsFromUpstream(): Promise<any[]> {
   try {
     const res = await fetch(`${UPSTREAM}/v1/models`, { signal: AbortSignal.timeout(10000) });
-    if (!res.ok) return [];
+    if (!res.ok) return cachedModels;
     const data = await res.json() as any;
     const models = data.data || data.models || [];
-    cachedModels = models;
+    // 只保留 -free 后缀的模型，和 /v1/models 的过滤规则保持一致，
+    // 免得面板下拉框列出一堆实际调不通的付费模型
+    const free = models.filter((m: any) => {
+      const id = String(m.id || '');
+      return id.endsWith('-free') || id === 'big-pickle';
+    });
+    cachedModels = free.length ? free : models;
     cachedModelsTime = Date.now();
     saveModelsCache();
-    return models;
+    return cachedModels;
   } catch {
     return cachedModels;
   }
@@ -983,8 +1004,20 @@ const MIME_TYPES: Record<string, string> = {
 /** 从 public/ 目录安全地提供静态文件；返回 true 表示已处理响应 */
 function serveStatic(res: http.ServerResponse, urlPath: string): boolean {
   try {
+    // 面板 index.html 里写的是 /public/app.js、/public/style.css，
+    // 而 PUBLIC_DIR 本身就是 <cwd>/public。若直接拼路径会去找
+    // <cwd>/public/public/app.js（不存在），于是落到 SPA fallback 返回
+    // index.html —— 浏览器拿 text/html 当 JS 执行，静默失败、页面永远卡在
+    // 「加载中...」。这里先剥掉 /public 前缀，让两种写法都能命中。
+    //
+    // 注意：path.normalize 在 Windows 上会把 / 转成 \，
+    // 所以先统一成正斜杠再做前缀判断，否则本地怎么测都不对。
+    let safePath = path.normalize(urlPath).replace(/\\/g, '/');
+    safePath = safePath.replace(/^\/+/, '/');
+    if (safePath === '/public' || safePath === '/public/') safePath = '/';
+    else if (safePath.startsWith('/public/')) safePath = safePath.slice('/public'.length);
+
     // 解析到 public 目录内的真实路径，防目录穿越
-    const safePath = path.normalize(urlPath).replace(/^(\/\/)+/, '/');
     const filePath = path.join(PUBLIC_DIR, safePath);
     if (!filePath.startsWith(PUBLIC_DIR + path.sep) && filePath !== PUBLIC_DIR) return false;
     if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return false;
@@ -1062,6 +1095,141 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
     }
 
     // ───────────────────────────────────────────────
+    //  GET /api/status  — 面板仪表盘用的完整状态
+    //  面板是照 gate-docker.ts 写的，调 /api/status，而本入口（gate.ts）
+    //  的状态接口叫 /status，字段名也不同 → 面板永远拿不到数据。
+    //  这里把两边字段名对齐，pool/proxy 相关的用空值兜底。
+    // ───────────────────────────────────────────────
+    if (pathname === '/api/status' && method === 'GET') {
+      const keyRecords = Object.values(apiKeys).map((k: any) => ({ ...k, fullKey: k.key }));
+      json(res, 200, {
+        uptime: Date.now() - START_TIME,
+        uptimeSec: Math.floor((Date.now() - START_TIME) / 1000),
+        version: '0.2.0',
+        mode: 'singbox',
+        // 面板读这几个字段
+        totalApiKeys: keyRecords.length,
+        activeKeys: Object.values(activeRequests).filter((n: number) => n > 0).length,
+        maxActiveKeys: 20,
+        slotsPerKey: 3,
+        candidatesCount: 0,
+        pools: [],
+        proxyCount: 0,
+        aliveProxies: 0,
+        // SingBox 版没有 WARP，对齐成"关闭"
+        warpAvailable: false,
+        warpMode: 'off',
+        warpStatus: 'stopped',
+        warpSkipUntil: 0,
+        // SingBox 专属字段
+        singbox: { mode: SINGBOX_MODE, ok: singboxOk, nodes: singboxNodes.length, currentNode: singboxNodeIndex },
+        // 代理源相关（SingBox 版没有代理池概念）
+        sources: [],
+        proxyRefreshMs: runtimeConfig.proxyRefreshMs || 0,
+        stats,
+        activeRequests: Object.values(activeRequests).reduce((a, b) => a + b, 0),
+        cachedModels: cachedModels.length,
+        keys: keyRecords,
+      });
+      return;
+    }
+
+    // ───────────────────────────────────────────────
+    //  GET /api/sources  — SingBox 版没有公共代理源，返回空列表占位
+    // ───────────────────────────────────────────────
+    if (pathname === '/api/sources' && method === 'GET') {
+      json(res, 200, { sources: [] });
+      return;
+    }
+
+    // ───────────────────────────────────────────────
+    //  GET /api/proxies  — SingBox 版没有代理池，返回空列表占位
+    // ───────────────────────────────────────────────
+    if (pathname === '/api/proxies' && method === 'GET') {
+      json(res, 200, { proxies: [], total: 0 });
+      return;
+    }
+
+    // ───────────────────────────────────────────────
+    //  面板按钮发的几个 POST（代理池/代理源相关）
+    //  SingBox 版没有这些子系统，统一返回成功并说明不可用，
+    //  免得面板弹「操作失败」红 toast。
+    // ───────────────────────────────────────────────
+    if (method === 'POST' && (
+      pathname === '/api/refresh' ||
+      pathname === '/api/promote' ||
+      pathname === '/api/sources/refresh' ||
+      pathname === '/api/released/probe'
+    )) {
+      json(res, 200, {
+        success: true,
+        applied: false,
+        message: 'SingBox 版没有代理池子系统，该操作无实际效果（代理由 sing-box 订阅节点提供）',
+      });
+      return;
+    }
+
+    // ───────────────────────────────────────────────
+    //  GET /api/config  — 面板「系统配置」页读这个
+    // ───────────────────────────────────────────────
+    if (pathname === '/api/config' && method === 'GET') {
+      json(res, 200, {
+        port: PORT,
+        maxActiveKeys: 20,
+        slotsPerKey: 3,
+        slotCount: 3,
+        proxyRefreshMs: runtimeConfig.proxyRefreshMs || 0,
+        warpMode: 'off',
+        fallbackProxy: '',
+        apiKey: API_KEY,
+        // SingBox 相关
+        singboxMode: SINGBOX_MODE,
+        singboxHost: SINGBOX_HOST,
+        singboxHttpPort: SINGBOX_HTTP_PORT,
+        singboxSocksPort: SINGBOX_SOCKS_PORT,
+        singboxApiPort: SINGBOX_API_PORT,
+      });
+      return;
+    }
+
+    // ───────────────────────────────────────────────
+    //  POST /api/config  — 面板「系统配置」页的保存按钮
+    //  SingBox 版的 port / warpMode 是启动时读环境变量的（const），
+    //  运行期改不了，这里明确回 501 而不是假装成功。
+    //  proxyRefreshMs 可以落盘，保存到 data/runtime_config.json。
+    // ───────────────────────────────────────────────
+    if (pathname === '/api/config' && method === 'POST') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const applied: string[] = [];
+      const ignored: string[] = [];
+
+      // 可运行时生效的
+      if (typeof body.proxyRefreshMs === 'number' && body.proxyRefreshMs > 0) {
+        runtimeConfig.proxyRefreshMs = body.proxyRefreshMs;
+        applied.push('proxyRefreshMs');
+      }
+
+      // 需要重启 / 改环境变量的
+      for (const k of ['port', 'maxActiveKeys', 'slotCount', 'warpMode', 'fallbackProxy']) {
+        if (body[k] !== undefined) ignored.push(k);
+      }
+
+      saveRuntimeConfig();
+      json(res, 200, {
+        success: true,
+        applied,
+        ignored,
+        message: applied.length
+          ? `已保存: ${applied.join(', ')}`
+          : '没有可运行时修改的项',
+        hint: ignored.length
+          ? `${ignored.join(', ')} 是启动时读取的环境变量，修改需要改 compose/.env 后重建容器：PORT / MAX_ACTIVE_KEYS / SINGBOX_MODE / FALLBACK_PROXY`
+          : '',
+      });
+      return;
+    }
+
+    // ───────────────────────────────────────────────
     //  GET /api/logs
     // ───────────────────────────────────────────────
     if (pathname === '/api/logs' && method === 'GET') {
@@ -1081,7 +1249,11 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
     //  GET /api/keys
     // ───────────────────────────────────────────────
     if (pathname === '/api/keys' && method === 'GET') {
-      json(res, 200, { keys: apiKeys });
+      // 面板 fetchKeys() 期望 keys 是数组并用 x.fullKey 取全量 key，
+      // 这里同时给出数组（records）和原始对象（map），
+      // 免得改前端。数组元素补 fullKey 字段。
+      const records = Object.values(apiKeys).map((k: any) => ({ ...k, fullKey: k.key }));
+      json(res, 200, { keys: records, records, map: apiKeys, total: records.length });
       return;
     }
 
@@ -1118,7 +1290,8 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
     //  GET /api/models
     // ───────────────────────────────────────────────
     if (pathname === '/api/models' && method === 'GET') {
-      json(res, 200, { data: cachedModels, cachedAt: cachedModelsTime });
+      // 面板 fetchModels() 读 s.models，这里同时给出 models 别名
+      json(res, 200, { data: cachedModels, models: cachedModels, cachedAt: cachedModelsTime, count: cachedModels.length });
       return;
     }
 
