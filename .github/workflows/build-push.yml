@@ -51,25 +51,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "$USERNAME" ]; then
-            echo "::error::缺少 secret DOCKER_HUB_USERNAME"
-            exit 1
+          SHA="${GITHUB_SHA::7}"
+
+          # workflow_dispatch 的 push_image=false → 只构建不推
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$DISPATCH_PUSH" = "false" ]; then
+            PUSH=false
+          elif [ -n "$USERNAME" ]; then
+            PUSH=true
+          else
+            # 没配 DOCKER_HUB_USERNAME 时降级为「只构建验证」，
+            # 免得每次 push 都把 run 打成红色。真正推镜像走：
+            #   pwsh -File scripts/trigger-build.ps1
+            # 那里用 Actions-buildUtils 已有的 dockerhub 凭据。
+            echo "::warning::未配置 secret DOCKER_HUB_USERNAME，本次只构建不推送。"
+            echo "::warning::推送镜像请运行：pwsh -File scripts/trigger-build.ps1"
+            PUSH=false
           fi
 
-          IMAGE="$USERNAME/$IMAGE_NAME"
-          SHA="${GITHUB_SHA::7}"
+          IMAGE="${USERNAME:-${{ github.repository_owner }}/$IMAGE_NAME}"
 
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             TAGS="$IMAGE:${GITHUB_REF_NAME},$IMAGE:latest"
           else
             TAGS="$IMAGE:sha-$SHA,$IMAGE:latest"
-          fi
-
-          # workflow_dispatch 的 push_image=false → 只构建不推
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$DISPATCH_PUSH" = "false" ]; then
-            PUSH=false
-          else
-            PUSH=true
           fi
 
           {
