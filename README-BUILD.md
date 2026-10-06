@@ -16,29 +16,48 @@
 
 ## 必需 Secrets
 
-仓库 `Settings → Secrets and variables → Actions`：
+推 Docker Hub 需要两个 secret：
 
 | 名称 | 说明 |
 |---|---|
 | `DOCKER_HUB_USERNAME` | Docker Hub 用户名 |
 | `DOCKER_HUB_ACCESS_TOKEN` | Docker Hub Access Token（read/write 权限） |
 
-`qq4756283/Actions-buildUtils` 里这两个 secret 已经存在，本仓库需要另外添加。
+**当前状态**：这两个 secret 只存在于 `qq4756283/Actions-buildUtils`。
+本仓库（`qq4756283/opencode2api-free`）没配，所以 `build-push.yml` 检测不到时会
+**降级为只构建不推送**（run 显示绿色 + 一条 warning），不会每次 push 都把 CI 打成红色。
+
+想让它自己推，两选一：
+
+1. 在本仓库 `Settings → Secrets and variables → Actions` 补上这两个 secret，
+   `build-push.yml` 随即自动切换到推送模式；
+2. 继续用 `scripts\trigger-build.cmd`，由 Actions-buildUtils 用它已有的凭据推
+   （已验证跑通，见下）。
+
+不配 secret 也能手动触发只构建验证：`build-push.yml` → Run workflow →
+`push_image` 设为 `false`。
 
 ## 用法一：手动触发 Actions-buildUtils
 
-```powershell
-# 默认：构建本仓库 main，latest + 时间 tag
-pwsh -File scripts/trigger-build.ps1
+Windows 默认执行策略是 Restricted，会拦 `.ps1`，所以用 `.cmd` 包装
+（只做一次性 `-ExecutionPolicy Bypass`，不改全局策略）：
 
-# 代构建上游仓库（必须带 dockerFileUrl，见下方"为什么需要自定义 Dockerfile"）
-pwsh -File scripts/trigger-build.ps1 `
-  -RepoUrl https://github.com/spfnas/opencode2api-free.git `
-  -DockerFileUrl https://raw.githubusercontent.com/qq4756283/opencode2api-free/main/Dockerfile
+```bat
+REM 默认：构建本仓库 main，latest + 时间 tag
+scripts\trigger-build.cmd
 
-# 只验证构建不推送
-pwsh -File scripts/trigger-build.ps1 -NoTimeTag
+REM 不打时间 tag
+scripts\trigger-build.cmd -TimeTag none
+
+REM 代构建上游仓库（必须带 dockerFileUrl，见下方"为什么必须传自定义 Dockerfile"）
+scripts\trigger-build.cmd -RepoUrl https://github.com/spfnas/opencode2api-free.git
+
+REM 多 tag + 单平台
+scripts\trigger-build.cmd -Tags latest,dev -Platforms linux/amd64
 ```
+
+`-TimeTag` 可选值：`none` / `y-md_H-m-s` / `y-md_H-m` / `md_H-m-s` / `md_H-m`（默认 `y-md_H-m-s`），
+脚本内部转成 Actions-buildUtils 期望的中文选项值。
 
 脚本从 `git credential fill` 读已登录的 GitHub token，也可直接给 `$env:GITHUB_TOKEN`。
 
@@ -79,6 +98,18 @@ CI runner 上 `docker pull opencode-gate:latest` 必然 404 → 构建直接失�
 
 本仓库的 Dockerfile 改成自包含：多阶段、`node:22-alpine`、`npm ci` 装依赖、
 tsx 直接跑 TypeScript，不依赖任何预构建基础镜像。
+
+## 已验证的构建结果
+
+`scripts\trigger-build.cmd` 实跑（Actions-buildUtils run `37511569091`）：
+
+- `docker/build-push-action` → **success**
+- 两个架构都构建：`pkg:docker/node@22-alpine?platform=linux/amd64` + `?platform=linux/arm64`
+- 依赖安装正常：`added 8 packages in 2s`
+- 推送 tag：`<你的dockerhub用户名>/opencode-gate:latest`
+- manifest digest：`sha256:c93ffaf3218b5bc93179ced74bb1ecda8ef31929d7aae63efc32817a35eae5f7`
+
+本仓库自带 `build-push.yml`（不推，只验证 Dockerfile）run `37511253717` → **success**。
 
 ## 修掉的一个崩溃 bug
 
