@@ -2,7 +2,17 @@
    opencode-free-gate · app.js (对接本地 API)
    ============================================================ */
 const $ = id => document.getElementById(id);
-const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+// 用于 onclick="fn('...')" 这类 JS 字符串字面量上下文的转义。
+// esc() 转义的是 HTML 实体，在 JS 字符串里不解码，等于没防护；
+// 这里转义反斜杠和引号，防止从 key 里逃逸出字符串字面量注入代码。
+const escJs = s => String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/</g,'\\u003c').replace(/>/g,'\\u003e');
+// ADMIN_TOKEN 存在 localStorage。sessionStorage 不够（每次刷新都要重输），
+// 但明文存 localStorage 只在「浏览器能读到页面脚本」的前提下才有风险 ——
+// 有 ADMIN_TOKEN 说明服务端已经鉴权，前端拿不到额外权限。
+const ADMIN_TOKEN_KEY = 'gate_admin_token';
+function getAdminToken() { try { return localStorage.getItem(ADMIN_TOKEN_KEY) || ''; } catch (_) { return ''; } }
+function setAdminToken(t) { try { if (t) localStorage.setItem(ADMIN_TOKEN_KEY, t); else localStorage.removeItem(ADMIN_TOKEN_KEY); } catch (_) {} }
 function toast(msg, type) {
   const el = $('toast');
   if (!el) return;
@@ -15,6 +25,9 @@ function toast(msg, type) {
 }
 async function api(u, method, body) {
   const o = { method: method || 'GET', headers: { 'Content-Type': 'application/json' } };
+  // 配了 ADMIN_TOKEN 后 /api/* 要带 token。没配时服务端不校验，带了也无害。
+  const t = getAdminToken();
+  if (t) o.headers['X-Admin-Token'] = t;
   if (body) o.body = JSON.stringify(body);
   let r;
   try {
@@ -29,6 +42,12 @@ async function api(u, method, body) {
   } catch (_) {
     // 服务端返回了非 JSON（常见于反代返回 HTML 错误页），这里给出可读信息
     throw new Error('HTTP ' + r.status + ' 返回非 JSON (' + text.length + ' 字节): ' + text.slice(0, 120));
+  }
+  if (r.status === 401 && u.startsWith('/api/')) {
+    // 多半是缺/错 ADMIN_TOKEN，直接弹输入框而不是干瞪眼
+    const t2 = prompt('需要管理权限。请输入 ADMIN_TOKEN：', '');
+    if (t2) { setAdminToken(t2.trim()); return api(u, method, body); }
+    throw new Error('需要管理权限（ADMIN_TOKEN）');
   }
   if (!r.ok) {
     const msg = (d && (d.error || d.message)) || ('HTTP ' + r.status);
@@ -144,6 +163,11 @@ function renderTable(headers, rows, emptyMsg) {
   if (!rows || !rows.length) return `<div class="text-center py-12"><span class="material-symbols-outlined text-5xl text-secondary/30 block mb-3">database</span><p class="text-body-md text-secondary">${esc(emptyMsg || '暂无数据')}</p></div>`;
   return `<table class="w-full text-body-md"><thead><tr class="border-b border-outline-variant bg-surface-container-low">${headers.map(h => `<th class="text-left px-4 py-3 text-label-md text-secondary font-semibold">${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>`;
 }
+// statRow 直接把单元格拼进 innerHTML，不做转义 —— 这是有意的：
+// 部分调用方传的是已构造好的 HTML（比如 <code>…</code>、按钮组）。
+// 约定：凡是来自接口/用户输入的值，必须自己先 esc()。
+// audit 表格原来把 d.date 等字段裸传，这里补上转义，
+// 避免服务端返回的字符串（含 <script>）被当 HTML 执行。
 function statRow(cells) {
   return `<tr class="border-b border-outline-variant hover:bg-surface-container-low transition-colors">${cells.map(c => `<td class="px-4 py-3">${c}</td>`).join('')}</tr>`;
 }
@@ -301,7 +325,8 @@ async function fetchAudit() {
     if(at) {
       const days = s.days || [];
       if(days.length) {
-        at.innerHTML = renderTable(['日期','请求数','Token','Prompt','Completion','缓存读取'], days.map(d => statRow([d.date||'-', d.requests||0, d.totalTokens||0, d.promptTokens||0, d.completionTokens||0, d.cacheRead||0])));
+        // d.date 来自接口数据，转义后再进 innerHTML
+        at.innerHTML = renderTable(['日期','请求数','Token','Prompt','Completion','缓存读取'], days.map(d => statRow([esc(d.date||'-'), d.requests||0, d.totalTokens||0, d.promptTokens||0, d.completionTokens||0, d.cacheRead||0])));
       } else {
         at.innerHTML = `<div class="text-center py-12"><span class="material-symbols-outlined text-5xl text-secondary/30 block mb-3">bar_chart</span><p class="text-body-md text-secondary">暂无调用记录</p></div>`;
       }
@@ -334,9 +359,9 @@ function renderKeys(keys, q) {
       return statRow([
         `<code class="text-mono-md px-1.5 py-0.5 bg-surface-container-high rounded">${esc(k.fullKey||k.key)}</code>`, esc(k.name||'-'), badge(statusLabel, status), k.maxConcurrency||'-', k.totalRequests||0, k.totalTokens||0,
         k.expiresAt?new Date(k.expiresAt).toLocaleString('zh-CN'):'永不',
-        `<div class="flex gap-1"><button onclick="editKey('${k.key}')" class="flex items-center justify-center w-8 h-8 rounded-2xl text-secondary hover:bg-surface-container-high hover:text-primary transition-colors cursor-pointer"><span class="material-symbols-outlined text-[18px]">edit</span></button>`+
-        `<button onclick="toggleKey('${k.key}')" class="flex items-center justify-center w-8 h-8 rounded-2xl text-secondary hover:bg-surface-container-high ${k.enabled!==false?'hover:text-warning':'hover:text-success'} transition-colors cursor-pointer"><span class="material-symbols-outlined text-[18px]">${k.enabled!==false?'pause':'play_arrow'}</span></button>`+
-        `<button onclick="deleteKey('${k.key}')" class="flex items-center justify-center w-8 h-8 rounded-2xl text-secondary hover:bg-surface-container-high hover:text-error transition-colors cursor-pointer"><span class="material-symbols-outlined text-[18px]">delete</span></button></div>`
+        `<div class="flex gap-1"><button onclick="editKey('${escJs(k.key)}')" class="flex items-center justify-center w-8 h-8 rounded-2xl text-secondary hover:bg-surface-container-high hover:text-primary transition-colors cursor-pointer"><span class="material-symbols-outlined text-[18px]">edit</span></button>`+
+        `<button onclick="toggleKey('${escJs(k.key)}')" class="flex items-center justify-center w-8 h-8 rounded-2xl text-secondary hover:bg-surface-container-high ${k.enabled!==false?'hover:text-warning':'hover:text-success'} transition-colors cursor-pointer"><span class="material-symbols-outlined text-[18px]">${k.enabled!==false?'pause':'play_arrow'}</span></button>`+
+        `<button onclick="deleteKey('${escJs(k.key)}')" class="flex items-center justify-center w-8 h-8 rounded-2xl text-secondary hover:bg-surface-container-high hover:text-error transition-colors cursor-pointer"><span class="material-symbols-outlined text-[18px]">delete</span></button></div>`
       ]);
     }), q?'未找到匹配「'+esc(q)+'」的密钥':'暂无密钥，点击上方「创建密钥」添加'
   );

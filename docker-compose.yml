@@ -10,8 +10,15 @@ services:
       - ./public:/app/public:ro
     environment:
       - PORT=13339
+      # ⚠ 这个 API_KEY 不是鉴权凭据，只是兼容旧字段；真正的调用 key 在
+      #   data/keys.json 里。管理接口鉴权请用 ADMIN_TOKEN。
       - API_KEY=${API_KEY:-admin123}
+      # 公网部署必填。留空 = /api/* 全部敞开（能列明文 key、改订阅）。
+      # 生成：openssl rand -hex 32
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DATA_DIR=/app/data
+      # 请求体上限（LLM 长上下文需要给够），默认 32MB
+      - MAX_BODY=${MAX_BODY:-33554432}
       # SingBox 版默认关；需要订阅节点时置 on 并保证 127.0.0.1:10801 有 sing-box
       - SINGBOX_MODE=${SINGBOX_MODE:-off}
       - SINGBOX_HOST=${SINGBOX_HOST:-127.0.0.1}

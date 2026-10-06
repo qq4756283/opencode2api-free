@@ -11,6 +11,16 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import net from 'node:net';
+import { promises as dnsPromises } from 'node:dns';
+
+// SSRF 校验用：DNS 解析失败时返回空结果而不是抛错
+async function dnsLookupSafe(hostname: string): Promise<{ addresses: Array<{ address: string; family: number }> }> {
+  try {
+    return await dnsPromises.lookup(hostname, { all: true, verbatim: true });
+  } catch {
+    return { addresses: [] };
+  }
+}
 
 // ═══════════════════════════════════════════════════════════
 //  类型定义
@@ -81,6 +91,46 @@ const SINGBOX_API_URL = `http://${SINGBOX_HOST}:${SINGBOX_API_PORT}`;
 
 const API_KEY = process.env.API_KEY || 'admin123';
 const START_TIME = Date.now();
+
+// ─────────────────────────────────────────────────────────────
+//  管理接口鉴权（可选）
+//
+//  历史问题：/api/* 全线无鉴权，API_KEY 只被 console.log 打印过一次，
+//  从未参与判断。公网部署时任何人都能列 key / 造 key / 删 key / 改订阅。
+//
+//  现在：设置 ADMIN_TOKEN 后，/api/*（除只读的 /api/status、/api/ping 外）
+//  必须带对 token 才能访问。不设置则保持原有敞开行为，
+//  以免破坏现有部署 —— 但公网部署强烈建议设置。
+//
+//  取 token 的三种方式，任一即可：
+//   Authorization: Bearer <ADMIN_TOKEN>
+//   X-Admin-Token: <ADMIN_TOKEN>
+//   ?token=<ADMIN_TOKEN>
+// ─────────────────────────────────────────────────────────────
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+// 只读、且不含敏感信息的接口允许匿名访问（给面板首屏用）
+const ADMIN_ANON_OK = new Set(['/api/status', '/api/ping', '/api/models']);
+
+function extractAdminToken(req: http.IncomingMessage, parsed: URL): string {
+  const h = String(req.headers['authorization'] || '');
+  const bearer = h.replace(/^Bearer\s+/i, '').trim();
+  if (bearer) return bearer;
+  const xt = String(req.headers['x-admin-token'] || '').trim();
+  if (xt) return xt;
+  return parsed.searchParams.get('token') || '';
+}
+
+function adminAuthorized(req: http.IncomingMessage, pathname: string, parsed: URL): boolean {
+  // 没配 ADMIN_TOKEN → 不启用鉴权（保持向后兼容）
+  if (!ADMIN_TOKEN) return true;
+  if (ADMIN_ANON_OK.has(pathname)) return true;
+  const provided = extractAdminToken(req, parsed);
+  if (!provided) return false;
+  // 定长比较，避免时序侧信道
+  const a = crypto.createHash('sha256').update(provided).digest();
+  const b = crypto.createHash('sha256').update(ADMIN_TOKEN).digest();
+  return crypto.timingSafeEqual(a, b);
+}
 
 // ═══════════════════════════════════════════════════════════
 //  全局状态
@@ -390,8 +440,90 @@ function saveSubscription(sub: SubscriptionConfig) {
   fs.writeFileSync(SUBSCRIPTION_FILE, JSON.stringify(sub, null, 2), 'utf-8');
 }
 
+// ─────────────────────────────────────────────────────────────
+//  订阅 URL 校验（SSRF 防护）
+//
+//  /api/subscription 的 url 直接喂给 fetch()。无校验的话，
+//  配合 /api/* 无鉴权，任何人都能让服务器去请求内网地址 /
+//  云元数据接口（http://169.254.169.254/...）拿凭据。
+//
+//  允许 http/https，且主机名不能解析到私有/保留网段。
+//  需要拉内网订阅时用 ALLOW_PRIVATE_FETCH=1 显式放开。
+// ─────────────────────────────────────────────────────────────
+const ALLOW_PRIVATE_FETCH = process.env.ALLOW_PRIVATE_FETCH === '1';
+
+function isPrivateIPv4(ip: string): boolean {
+  const p = ip.split('.').map(n => parseInt(n, 10));
+  if (p.length !== 4 || p.some(n => Number.isNaN(n) || n < 0 || n > 255)) return true; // 解析不出来一律当危险
+  const [a, b] = p;
+  if (a === 10) return true;                              // 10/8
+  if (a === 127) return true;                             // loopback
+  if (a === 0) return true;                               // 0/8
+  if (a === 172 && b >= 16 && b <= 31) return true;       // 172.16/12
+  if (a === 192 && b === 168) return true;                // 192.168/16
+  if (a === 169 && b === 254) return true;                // link-local 含云元数据 169.254.169.254
+  if (a === 100 && b >= 64 && b <= 127) return true;      // CGNAT 100.64/10
+  if (a >= 224) return true;                              // multicast + reserved
+  return false;
+}
+
+function isBlockedIPv6(ip: string): boolean {
+  // 去掉 zone id 和方括号
+  const h = ip.toLowerCase().replace(/^\[|\]$/g, '').split('%')[0];
+  if (h === '::' || h === '::1') return true;              // unspecified / loopback
+  if (h.startsWith('fe80')) return true;                   // link-local
+  if (/^f[cd]/.test(h)) return true;                        // fc00::/7 unique-local
+  // IPv4 映射地址 ::ffff:a.b.c.d —— 直接按 IPv4 判
+  const mapped = h.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (mapped) return isPrivateIPv4(mapped[1]);
+  return false;
+}
+
+function isBlockedHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (h.endsWith('.internal') || h.endsWith('.local')) return true;
+  if (h === 'metadata.google.internal') return true;       // GCP 元数据
+  if (h === 'metadata' || h.endsWith('.metadata')) return true;
+  // IPv6 字面量：[::1] → 去掉方括号后交给 isBlockedIPv6
+  if (h.includes(':')) return isBlockedIPv6(h);
+  const v4 = h.match(/^(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (v4) return isPrivateIPv4(v4[1]);
+  return false;
+}
+
+async function assertFetchableUrl(rawUrl: string): Promise<void> {
+  let u: URL;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    throw new Error('URL 格式非法');
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    throw new Error(`仅支持 http/https，收到 ${u.protocol}`);
+  }
+  if (ALLOW_PRIVATE_FETCH) return;
+  if (isBlockedHost(u.hostname)) {
+    throw new Error(`目标地址 ${u.hostname} 属于内网/保留网段，已拒绝（需要的话设 ALLOW_PRIVATE_FETCH=1 放开）`);
+  }
+  // 域名可能被 DNS 解析到内网（DNS rebinding），这里解析一次再判。
+  // 解析失败一律拒绝 —— 拿不到地址就没法确认安全，放行等于把
+  // 判断权交给攻击者的 DNS。
+  const { addresses } = await dnsLookupSafe(u.hostname);
+  if (addresses.length === 0) {
+    throw new Error(`${u.hostname} DNS 解析失败，无法确认地址安全性，已拒绝`);
+  }
+  for (const addr of addresses) {
+    const bad = addr.family === 4 ? isPrivateIPv4(addr.address) : isBlockedIPv6(addr.address);
+    if (bad) {
+      throw new Error(`${u.hostname} 解析到内网/保留地址 ${addr.address}，已拒绝`);
+    }
+  }
+}
+
 // 生成 sing-box 配置（复用 glm-proxy 的 vless 解析逻辑）
 async function generateSingboxConfig(sub: SubscriptionConfig): Promise<number> {
+  await assertFetchableUrl(sub.url);
   // 拉取订阅
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30000);
@@ -400,6 +532,7 @@ async function generateSingboxConfig(sub: SubscriptionConfig): Promise<number> {
     const res = await fetch(sub.url, {
       headers: { 'user-agent': 'curl/8.0' },
       signal: controller.signal,
+      redirect: 'follow',
     });
     if (!res.ok) throw new Error(`订阅拉取失败 HTTP ${res.status}`);
     raw = await res.text();
@@ -553,6 +686,29 @@ function releaseKey(key: string) {
   if (activeRequests[key] > 0) activeRequests[key]--;
 }
 
+// keys.json 落盘节流。
+//
+// 原来每次请求都 saveKeys()（同步 writeFileSync 全量重写），
+// 高 QPS 下是明确的 I/O 瓶颈，而且并发写同一文件有损坏风险。
+// 改成内存计数 + 延迟落盘：先进内存保证限流判断读到最新值，
+// 写盘按 KEY_FLUSH_MS 合并，并在退出前 flush。
+const KEY_FLUSH_MS = 5000;
+let keyDirty = false;
+let keyFlushTimer: NodeJS.Timeout | null = null;
+
+function scheduleKeyFlush() {
+  keyDirty = true;
+  if (keyFlushTimer) return;
+  keyFlushTimer = setTimeout(() => {
+    keyFlushTimer = null;
+    if (!keyDirty) return;
+    keyDirty = false;
+    saveKeys();
+  }, KEY_FLUSH_MS);
+  // 不要因为这个定时器把进程吊住
+  if (typeof keyFlushTimer.unref === 'function') keyFlushTimer.unref();
+}
+
 function recordKeyUsage(key: string, tokens: number) {
   const record = apiKeys[key];
   if (record) {
@@ -560,7 +716,7 @@ function recordKeyUsage(key: string, tokens: number) {
     record.totalTokens += tokens;
     record.requestCount++;
     record.lastUsedAt = Date.now();
-    saveKeys();
+    scheduleKeyFlush();
   }
 }
 
@@ -590,7 +746,49 @@ function audit(status: number, latencyMs: number, keyId: string, path: string, b
   };
   auditLog.push(entry);
   if (auditLog.length > MAX_AUDIT) auditLog.shift();
-  fs.appendFileSync(AUDIT_FILE, JSON.stringify(entry) + '\n');
+  appendAudit(entry);
+}
+
+// audit.jsonl 只 append、从不轮转，长期跑会把磁盘写满。
+// 按大小轮转，保留最近 N 份。
+const AUDIT_MAX_BYTES = parseInt(process.env.AUDIT_MAX_BYTES || `${64 * 1024 * 1024}`);
+const AUDIT_KEEP = parseInt(process.env.AUDIT_KEEP || '5');
+let auditBytes = 0;
+
+function appendAudit(entry: AuditEntry) {
+  const line = JSON.stringify(entry) + '\n';
+  try {
+    // 启动时算一次现有大小，之后增量维护
+    if (!auditBytes) {
+      auditBytes = fs.existsSync(AUDIT_FILE) ? fs.statSync(AUDIT_FILE).size : 0;
+    }
+    if (auditBytes + line.length > AUDIT_MAX_BYTES) {
+      rotateAudit();
+    }
+    fs.appendFileSync(AUDIT_FILE, line);
+    auditBytes += line.length;
+  } catch (e: any) {
+    console.error(`[Audit] 写入失败: ${e.message}`);
+  }
+}
+
+function rotateAudit() {
+  try {
+    // audit.jsonl → audit.jsonl.1 → … → audit.jsonl.(KEEP)
+    for (let i = AUDIT_KEEP - 1; i >= 1; i--) {
+      const from = `${AUDIT_FILE}.${i}`;
+      const to = `${AUDIT_FILE}.${i + 1}`;
+      if (fs.existsSync(from)) {
+        if (i + 1 > AUDIT_KEEP) { fs.unlinkSync(from); continue; }
+        fs.renameSync(from, to);
+      }
+    }
+    if (fs.existsSync(AUDIT_FILE)) fs.renameSync(AUDIT_FILE, `${AUDIT_FILE}.1`);
+    auditBytes = 0;
+    console.log(`[Audit] 已轮转（上限 ${Math.floor(AUDIT_MAX_BYTES / 1024 / 1024)}MB）`);
+  } catch (e: any) {
+    console.error(`[Audit] 轮转失败: ${e.message}`);
+  }
 }
 
 function loadAuditLog() {
@@ -963,12 +1161,44 @@ async function dispatchNonStream(
   const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(errBody)); controller.close(); } });
   audit(502, 0, keyId, reqPath);
   return { status: 502, stream, headers: {} };
-}function readBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve) => {
+}
+
+// 请求体上限：LLM 对话 body 天然可能很大（含长上下文），
+// 但不设上限的话任何人都能 POST 一个超大 body 把进程 OOM 掉。
+const MAX_BODY = parseInt(process.env.MAX_BODY || `${32 * 1024 * 1024}`);
+
+class BodyTooLargeError extends Error {
+  constructor(limit: number) {
+    super(`请求体超过上限 ${Math.floor(limit / 1024 / 1024)}MB`);
+    this.name = 'BodyTooLargeError';
+  }
+}
+
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    req.on('error', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+    let size = 0;
+    let settled = false;
+
+    const done = (fn: () => void) => { if (settled) return; settled = true; fn(); };
+
+    req.on('data', (c: Buffer) => {
+      if (settled) return;
+      size += c.length;
+      if (size > MAX_BODY) {
+        // 只 pause 不 destroy —— destroy 会立刻掐掉 socket，
+        // 客户端收到的是 connection reset 而不是 413。
+        // socket 由 handler 在写完 413 响应后再关。
+        req.pause();
+        done(() => reject(new BodyTooLargeError(MAX_BODY)));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => done(() => resolve(Buffer.concat(chunks).toString('utf-8'))));
+    req.on('error', (e) => done(() => reject(e)));
+    // 超限后上游可能还在推数据，丢弃即可，别再进 chunks
+    req.on('aborted', () => done(() => reject(new Error('请求被中断'))));
   });
 }
 
@@ -1043,6 +1273,18 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
   const pathname = parsed.pathname;
 
   try {
+    // ───────────────────────────────────────────────
+    //  管理接口鉴权
+    //  配了 ADMIN_TOKEN 才会拦；/api/status /api/ping /api/models 放行给面板首屏
+    // ───────────────────────────────────────────────
+    if (pathname.startsWith('/api/') && !adminAuthorized(req, pathname, parsed)) {
+      json(res, 401, {
+        error: { message: '需要管理权限：带 Authorization: Bearer <ADMIN_TOKEN> 或 X-Admin-Token 头重试' },
+        hint: '未配置 ADMIN_TOKEN 时不启用鉴权。公网部署请在 compose 里加 -e ADMIN_TOKEN=<随机长串>',
+      });
+      return;
+    }
+
     // ───────────────────────────────────────────────
     //  GET /ping  — 健康检查（Docker HEALTHCHECK 用）
     //  必须在此处处理：曾用 server.on('request') 额外注册监听器，
@@ -1241,7 +1483,35 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
     //  GET /api/audit
     // ───────────────────────────────────────────────
     if (pathname === '/api/audit' && method === 'GET') {
-      json(res, 200, { audit: auditLog.slice(-500) });
+      // 面板 fetchAudit() 读 s.summary 和 s.days，这里一并算出来，
+      // 否则审计页永远是空的（只有 audit 原始数组没人用）。
+      const entries = auditLog;
+      let totalRequests = 0, totalTokens = 0, totalPrompt = 0, totalCompletion = 0, cacheRead = 0;
+      const byDay: Record<string, { requests: number; totalTokens: number; promptTokens: number; completionTokens: number; cacheRead: number }> = {};
+      for (const e of entries) {
+        totalRequests++;
+        totalTokens += e.totalTokens || 0;
+        totalPrompt += e.promptTokens || 0;
+        totalCompletion += e.completionTokens || 0;
+        cacheRead += e.cacheRead || 0;
+        const d = new Date(e.ts);
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        const b = byDay[key] || (byDay[key] = { requests: 0, totalTokens: 0, promptTokens: 0, completionTokens: 0, cacheRead: 0 });
+        b.requests++;
+        b.totalTokens += e.totalTokens || 0;
+        b.promptTokens += e.promptTokens || 0;
+        b.completionTokens += e.completionTokens || 0;
+        b.cacheRead += e.cacheRead || 0;
+      }
+      const days = Object.keys(byDay).sort().reverse().map((date) => ({ date, ...byDay[date] }));
+      json(res, 200, {
+        audit: entries.slice(-500),
+        summary: {
+          totalRequests, totalTokens, totalPrompt, totalCompletion,
+          cacheHitRate: totalPrompt > 0 ? cacheRead / totalPrompt : 0,
+        },
+        days,
+      });
       return;
     }
 
@@ -1466,13 +1736,23 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
     // ───────────────────────────────────────────────
     if (method === 'GET' && !pathname.startsWith('/api/') && !pathname.startsWith('/v1/') && pathname !== '/status' && pathname !== '/ping') {
       if (serveStatic(res, pathname)) return;
+
       // SPA fallback：非 API 路径找不到文件时回退 index.html
-      const idxPath = PUBLIC_DIR + '/index.html';
-      if (fs.existsSync(idxPath)) {
-        const data = fs.readFileSync(idxPath);
-        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
-        res.end(data);
-        return;
+      //
+      // 但带扩展名的请求（.js/.css/.png…）必须老实返 404。
+      // 否则缺失的静态资源会拿到 index.html + HTTP 200，
+      // 浏览器把 text/html 当 JS 执行 → 静默失败、面板永远"加载中"，
+      // 而且 CDN / 浏览器会把这些假 200 缓存起来掩盖真实错误。
+      const ext = path.extname(pathname).toLowerCase();
+      const looksLikeAsset = ext !== '' && ext in MIME_TYPES;
+      if (!looksLikeAsset) {
+        const idxPath = PUBLIC_DIR + '/index.html';
+        if (fs.existsSync(idxPath)) {
+          const data = fs.readFileSync(idxPath);
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
+          res.end(data);
+          return;
+        }
       }
     }
 
@@ -1482,6 +1762,12 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
     json(res, 404, { error: { message: 'not found' } });
 
   } catch (e: any) {
+    if (e instanceof BodyTooLargeError) {
+      // 响应写完再断连接：body 没收完时保持连接会占着 socket 和内存。
+      res.on('finish', () => { try { req.destroy(); } catch {} });
+      json(res, 413, { error: { message: e.message } });
+      return;
+    }
     console.error(`[handler] ${e.message}`);
     json(res, 500, { error: { message: e.message } });
   }
@@ -1493,8 +1779,28 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
 
 const server = http.createServer(handler);
 
+// 超时收紧。Node 默认 requestsTimeout=300s / headersTimeout=60s，
+// 对一个反代网关来说太宽松：慢速攻击（Slowloris）能靠一堆半开连接
+// 把并发槽位占满。这里给网关级合理值。
+// 注意 requestsTimeout 必须 > headersTimeout。
+server.headersTimeout = 20_000;
+server.requestTimeout = 120_000;   // 单请求含 body 上传，超过直接断
+server.keepAliveTimeout = 15_000;
+server.maxHeadersCount = 100;
+
+// 限制同时打开的上游连接数，防止单实例被打爆
+server.maxConnections = parseInt(process.env.MAX_CONNECTIONS || '2048');
+
 // /ping 已在 handler 内部处理；不要再注册第二个 'request' 监听器，
 // 否则响应写完后再次 writeHead 会抛 ERR_HTTP_HEADERS_SENT 使进程崩溃。
+
+// 未捕获异常不要静默退出，记录后继续跑；只有 listen 阶段的错误才致命
+process.on('uncaughtException', (e: any) => {
+  console.error(`[fatal] uncaughtException: ${e?.message}\n${e?.stack || ''}`);
+});
+process.on('unhandledRejection', (r: any) => {
+  console.error(`[fatal] unhandledRejection: ${r?.message || r}`);
+});
 
 server.listen(PORT, '0.0.0.0', async () => {
   console.log(`\n[opencode-gate] SingBox 版启动`);
@@ -1502,7 +1808,9 @@ server.listen(PORT, '0.0.0.0', async () => {
   console.log(`[opencode-gate] 上游: ${UPSTREAM}`);
   console.log(`[opencode-gate] SingBox: ${SINGBOX_MODE === 'on' ? `Socks5 ${SINGBOX_SOCKS_URL} / API ${SINGBOX_API_URL}` : '关闭'}`);
   console.log(`[opencode-gate] 数据目录: ${DATA_DIR}`);
-  console.log(`[opencode-gate] API Key: ${API_KEY}\n`);
+  // 不打印 API_KEY 明文 —— 日志会进 docker logs / 日志文件，可能被人捡到。
+  // 原来这行是 `API Key: ${API_KEY}`，属于凭据泄漏。
+  console.log(`[opencode-gate] 鉴权: /v1/* 用 keys.json 里的 key；/api/* ${ADMIN_TOKEN ? '已启用 ADMIN_TOKEN 保护' : '未配置 ADMIN_TOKEN —— 公网部署请务必配置'}\n`);
 
   // 加载持久化数据
   loadKeys();
@@ -1532,5 +1840,13 @@ server.listen(PORT, '0.0.0.0', async () => {
 });
 
 // 优雅关闭
-process.on('SIGTERM', () => { console.log('关闭中...'); server.close(); setTimeout(() => process.exit(0), 1000); });
-process.on('SIGINT', () => { console.log('关闭中...'); server.close(); setTimeout(() => process.exit(0), 1000); });
+function shutdown(signal: string) {
+  console.log(`收到 ${signal}，关闭中...`);
+  // 退出前把节流中的 key 用量落盘，避免丢掉最后几个请求的计数
+  if (keyDirty) { keyDirty = false; saveKeys(); }
+  server.close();
+  setTimeout(() => process.exit(0), 1000);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('exit', () => { if (keyDirty) { keyDirty = false; try { saveKeys(); } catch {} } });

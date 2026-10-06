@@ -183,6 +183,31 @@ let cachedModelsTime = 0;
 
 const API_KEY = process.env.API_KEY || 'admin123';
 
+// ─────────────────────────────────────────────────────────────
+//  管理接口鉴权（可选）—— 与 gate.ts 保持一致
+//
+//  原来 /api/* 全部路由都排在 v1 鉴权门之前，等于完全不设防：
+//  能列全量明文 key、建 key、改 key、删 key、看审计、导入代理。
+//  现在设置 ADMIN_TOKEN 后，/api/* 必须带对 token；
+//  /api/status 放行给面板首屏。不设置则保持原有敞开行为。
+//
+//  取 token：Authorization: Bearer <T> / X-Admin-Token: <T> / ?token=<T>
+// ─────────────────────────────────────────────────────────────
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const ADMIN_ANON_OK = new Set(['/api/status', '/api/ping', '/api/models']);
+
+function adminAuthorized(nodeReq: http.IncomingMessage, pathname: string, url: URL): boolean {
+  if (!ADMIN_TOKEN) return true;                 // 未启用鉴权
+  if (ADMIN_ANON_OK.has(pathname)) return true; // 匿名白名单
+  const h = String(nodeReq.headers['authorization'] || '').trim();
+  const bearer = h.replace(/^Bearer\s+/i, '').trim();
+  const provided = bearer || String(nodeReq.headers['x-admin-token'] || '').trim() || url.searchParams.get('token') || '';
+  if (!provided) return false;
+  const a = crypto.createHash('sha256').update(provided).digest();
+  const b = crypto.createHash('sha256').update(ADMIN_TOKEN).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
 let candidates: CandidateItem[] = [];
 let customSlots: Slot[] = [];
 const PROXY_MAX_FAILS = 3;
@@ -1063,12 +1088,37 @@ function collectHeadersFromReq(nodeReq: http.IncomingMessage): Record<string, st
   return h;
 }
 
+// 请求体上限：原来无限制，任何人都能 POST 超大 body 把进程 OOM 掉。
+// LLM 长上下文需要给足，默认 32MB。
+const MAX_BODY = parseInt(process.env.MAX_BODY || `${32 * 1024 * 1024}`);
+
+class BodyTooLargeError extends Error {
+  constructor(limit: number) {
+    super(`请求体超过上限 ${Math.floor(limit / 1024 / 1024)}MB`);
+    this.name = 'BodyTooLargeError';
+  }
+}
+
 function readBody(nodeReq: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    nodeReq.on('data', (c: Buffer) => chunks.push(c));
-    nodeReq.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    nodeReq.on('error', reject);
+    let size = 0;
+    let settled = false;
+    const done = (fn: () => void) => { if (settled) return; settled = true; fn(); };
+
+    nodeReq.on('data', (c: Buffer) => {
+      if (settled) return;
+      size += c.length;
+      if (size > MAX_BODY) {
+        nodeReq.pause();
+        done(() => reject(new BodyTooLargeError(MAX_BODY)));
+        return;
+      }
+      chunks.push(c);
+    });
+    nodeReq.on('end', () => done(() => resolve(Buffer.concat(chunks).toString('utf-8'))));
+    nodeReq.on('error', (e) => done(() => reject(e)));
+    nodeReq.on('aborted', () => done(() => reject(new Error('请求被中断'))));
   });
 }
 
@@ -1090,7 +1140,24 @@ function sendCors(nodeRes: http.ServerResponse) {
   nodeRes.end();
 }
 
-const server = http.createServer(async (nodeReq, nodeRes) => {
+const server = http.createServer((nodeReq, nodeRes) => {
+  // 整个 async 逻辑放进 gateHandler，用同步壳接住 rejection：
+  // createServer 的 async 回调抛错会变成 unhandledRejection，
+  // readBody 超限 / JSON 解析失败必须兜住，否则整个进程挂掉。
+  gateHandler(nodeReq, nodeRes).catch((e: any) => {
+    if (e instanceof BodyTooLargeError) {
+      sendJson(nodeRes, 413, { error: 'payload_too_large', message: e.message });
+      try { nodeReq.destroy(); } catch {}
+      return;
+    }
+    console.error(`[请求] 未捕获异常: ${e?.message}\n${e?.stack || ''}`);
+    if (!nodeRes.headersSent) {
+      sendJson(nodeRes, 500, { error: 'internal_error', message: e?.message || 'internal error' });
+    }
+  });
+});
+
+async function gateHandler(nodeReq: http.IncomingMessage, nodeRes: http.ServerResponse) {
   const url = new URL(nodeReq.url || '/', `http://${nodeReq.headers.host || 'localhost'}`);
   const pathname = url.pathname;
   const search = url.search;
@@ -1116,7 +1183,15 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
     return;
   }
   if (pathname.startsWith('/public/')) {
-    const filePath = path.join(process.cwd(), pathname);
+    // 原来直接 path.join(cwd, pathname) 拼路径，
+    // /public/../gate.ts 这类穿越能读到镜像里的源码。已加前缀校验。
+    const PUBLIC_ROOT = path.join(process.cwd(), 'public');
+    const filePath = path.resolve(PUBLIC_ROOT, '.' + pathname.slice('/public'.length));
+    if (!filePath.startsWith(PUBLIC_ROOT + path.sep) && filePath !== PUBLIC_ROOT) {
+      nodeRes.writeHead(403, { 'content-type': 'text/plain' });
+      nodeRes.end('Forbidden');
+      return;
+    }
     try {
       const data = fs.readFileSync(filePath);
       const ext = path.extname(filePath);
@@ -1130,6 +1205,21 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       nodeRes.writeHead(404);
       nodeRes.end('Not Found');
     }
+    return;
+  }
+
+  // ───────────────────────────────────────────────
+  //  管理接口鉴权（可选）
+  //  与 gate.ts 同一套逻辑：/api/* 之前必须过 ADMIN_TOKEN。
+  //  这里所有 /api/* 路由都在下面的 v1 鉴权门之前处理，
+  //  所以原来等于完全不设防（能列全量明文 key、建 key、删 key）。
+  // ───────────────────────────────────────────────
+  if (pathname.startsWith('/api/') && !adminAuthorized(nodeReq, pathname, url)) {
+    sendJson(nodeRes, 401, {
+      error: 'unauthorized',
+      message: '需要管理权限：带 Authorization: Bearer <ADMIN_TOKEN> 或 X-Admin-Token 头重试',
+      hint: '未配置 ADMIN_TOKEN 时不启用鉴权。公网部署请加 -e ADMIN_TOKEN=<随机长串>',
+    });
     return;
   }
 
@@ -1763,6 +1853,13 @@ async function fetchModelsFromUpstream(): Promise<any[]> {
 
   // –– 404 ––
   sendJson(nodeRes, 404, { error: 'not_found' });
+}
+
+process.on('unhandledRejection', (r: any) => {
+  console.error(`[fatal] unhandledRejection: ${r?.message || r}`);
+});
+process.on('uncaughtException', (e: any) => {
+  console.error(`[fatal] uncaughtException: ${e?.message}\n${e?.stack || ''}`);
 });
 
 // ═══════════════════════════════════════════════════════════

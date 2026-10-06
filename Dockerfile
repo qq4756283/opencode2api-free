@@ -27,7 +27,16 @@ ENV NODE_ENV=production \
     PORT=13339 \
     DATA_DIR=/app/data \
     SINGBOX_MODE=off \
-    API_KEY=admin123
+    MAX_BODY=33554432 \
+    AUDIT_MAX_BYTES=67108864 \
+    AUDIT_KEEP=5 \
+    MAX_CONNECTIONS=2048
+# ADMIN_TOKEN 不给默认值。配了它，/api/* 才要鉴权；
+# 不配 = 管理接口敞开（能列明文 key、建/删 key、改订阅）。
+# 公网部署必须显式设置，且不要写进镜像 —— 用 docker run -e 或 compose 的 .env。
+#
+# API_KEY 也不设默认：它不是鉴权凭据（见 README），调用用的 key 存在
+# data/keys.json，首次启动自动生成 sk-default。留这个变量纯粹为兼容旧配置。
 WORKDIR /app
 
 # tsx 作为 devDep 单独装到 runtime；node:22-alpine 自带 wget（busybox），HEALTHCHECK 直接用它

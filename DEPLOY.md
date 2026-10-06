@@ -4,8 +4,37 @@ opencode-gate 远程服务器部署教程
 
   镜像      qq4756283/opencode-gate:latest
   大小      69.5 MB
-  digest    sha256:c93ffaf3218b5bc93179ced74bb1ecda8ef31929d7aae63efc32817a35eae5f7
   端口      13339
+
+
+────────────────────────────────────────────────────────────
+零、先做这件事：配 ADMIN_TOKEN
+────────────────────────────────────────────────────────────
+
+不配的话，/api/* 管理接口全部裸奔 —— 任何人都能
+
+  GET    /api/keys             列出所有明文 API key
+  POST   /api/keys             造新 key
+  DELETE /api/keys/<key>       删 key
+  POST   /api/subscription     改订阅地址
+
+generate 一串：
+
+  openssl rand -hex 32
+
+写进 .env 的 ADMIN_TOKEN= 那一行，之后所有管理操作都要带它。
+
+⚠ 这套鉴权是本轮审计新加的。**旧镜像没有这个能力**，
+   你现在线上的容器如果还是旧 digest，管理接口仍然是敞开的。
+   升级镜像 + 配 ADMIN_TOKEN 两件事都做才算修好。
+
+面板会自动处理：第一次 401 时弹框要 token，输一次记住
+（存 localStorage）。
+
+**两套 key 别搞混：**
+
+  ADMIN_TOKEN   管 /api/*  管理、面板、改配置
+  sk-default    管 /v1/*   实际转发模型请求
 
 
 ─────────────────────────────────────────────────────────────
@@ -19,8 +48,11 @@ opencode-gate 远程服务器部署教程
     --restart always \
     -p 13339:13339 \
     -v /opt/opencode-gate/data:/app/data \
-    -e API_KEY=sk-default \
+    -e ADMIN_TOKEN="$(openssl rand -hex 32)" \
     qq4756283/opencode-gate:latest
+
+  # 忘了 token 就从容器环境里捞回来
+  docker inspect opencode-gate --format '{{range .Config.Env}}{{println .}}{{end}}' | grep ADMIN_TOKEN
 
 验证：
 
@@ -30,7 +62,7 @@ opencode-gate 远程服务器部署教程
   curl http://127.0.0.1:13339/v1/models \
     -H 'Authorization: Bearer sk-default'     # 模型列表
 
-管理面板在 http://<服务器IP>:13339/ ，用浏览器打开。
+管理面板在 http://<服务器IP>:13339/ ，浏览器打开后输一次 ADMIN_TOKEN。
 
 
 ─────────────────────────────────────────────────────────────
@@ -44,14 +76,17 @@ opencode-gate 远程服务器部署教程
 
 ### 2. 写 .env
 
-  cat > /opt/opencode-gate/.env <<'EOF'
+  ADMIN_TOKEN=$(openssl rand -hex 32)
+  cat > /opt/opencode-gate/.env <<EOF
   GATE_IMAGE=qq4756283/opencode-gate:latest
-  API_KEY=sk-default
+  ADMIN_TOKEN=$ADMIN_TOKEN
   TZ=Asia/Shanghai
   EOF
 
-API_KEY 这行是客户端调用时要带的 key。默认值是 sk-default，
-生产环境建议改掉，改完重启容器生效。
+  chmod 600 /opt/opencode-gate/.env
+  cat /opt/opencode-gate/.env        # 记下 ADMIN_TOKEN
+
+.env 里有管理凭据，chmod 600。
 
 ### 3. 写 docker-compose.yml
 
@@ -68,8 +103,9 @@ API_KEY 这行是客户端调用时要带的 key。默认值是 sk-default，
       environment:
         - TZ=Asia/Shanghai
         - PORT=13339
-        - API_KEY=${API_KEY:-sk-default}
+        - ADMIN_TOKEN=${ADMIN_TOKEN:?必须设置，见第零节}
         - DATA_DIR=/app/data
+        - MAX_BODY=33554432
         - SINGBOX_MODE=off
       healthcheck:
         test: ["CMD", "wget", "-qO-", "http://127.0.0.1:13339/ping"]
@@ -214,30 +250,34 @@ Ubuntu / Debian（ufw）：
 首次启动会在 /opt/opencode-gate/data/keys.json 建一个默认 key
 `sk-default`。之后可以用管理 API 加自己的 key。
 
+**以下所有命令都要带 ADMIN_TOKEN**（除非你没配这个变量）：
+
+  ADM="X-Admin-Token: <你的ADMIN_TOKEN>"
+
 列出现有 key：
 
-  curl http://127.0.0.1:13339/api/keys
+  curl http://127.0.0.1:13339/api/keys -H "$ADM"
 
 新建一个（自动生成 key 值）：
 
   curl -X POST http://127.0.0.1:13339/api/keys \
-    -H 'Content-Type: application/json' \
+    -H "$ADM" -H 'Content-Type: application/json' \
     -d '{"name":"my-app","maxConcurrency":5,"maxRequests":1000000}'
 
 指定 key 值新建：
 
   curl -X POST http://127.0.0.1:13339/api/keys \
-    -H 'Content-Type: application/json' \
+    -H "$ADM" -H 'Content-Type: application/json' \
     -d '{"key":"sk-mycustomkey","name":"my-app"}'
 
 删掉：
 
-  curl -X DELETE http://127.0.0.1:13339/api/keys/sk-mycustomkey
+  curl -X DELETE http://127.0.0.1:13339/api/keys/sk-mycustomkey -H "$ADM"
 
 改并发上限 / 过期时间：
 
   curl -X PUT http://127.0.0.1:13339/api/keys/sk-mycustomkey \
-    -H 'Content-Type: application/json' \
+    -H "$ADM" -H 'Content-Type: application/json' \
     -d '{"maxConcurrency":10}'
 
 限流规则：单 key 默认并发 5、请求数上限 100 万、有效期 1 年
@@ -248,18 +288,39 @@ Ubuntu / Debian（ufw）：
 六、安全提醒
 ─────────────────────────────────────────────────────────────
 
-**先说清楚这个镜像的现状**（读源码得到的，不是猜的）：
+**这轮安全审计修了什么**（都是读源码查出来的，不是猜的）：
 
-1. `/api/*` 管理接口**没有鉴权**。源码里 `API_KEY` 这个环境变量只被
-   `console.log` 打印了一次，从来没参与任何鉴权判断。能改 key、看审计
-   日志、切配置的接口全都裸着。所以：
+1. **`/api/*` 原来完全没鉴权**。源码里 `API_KEY` 环境变量只被 `console.log`
+   打印了一次，从没参与任何鉴权判断 —— 能列全量明文 key、建 key、删 key、
+   改订阅地址的接口全都裸着。
+   → 新增 `ADMIN_TOKEN`。配了就必须带 token，不配保持原样（向后兼容）。
+   **这是本轮最要紧的一条，你现在的线上容器还是旧镜像的话必须升级 + 配 token。**
 
-   - 绝对不要把 13339 直接暴露到公网
-   - 必须公网暴露的话，前面套一层 Nginx / Caddy 加 Basic Auth 或 IP 白名单
+2. **`POST /api/subscription` 是 SSRF 原语**。url 直接喂 `fetch()`，无协议和
+   地址校验 → 能让服务器去打云元数据接口（`http://169.254.169.254/...`）
+   拿凭据。已加协议白名单 + 内网/保留网段拦截（含 IPv6）+ DNS 解析后二次校验。
+   需要拉内网订阅时显式 `ALLOW_PRIVATE_FETCH=1`。
 
-2. `/v1/*` 有 key 校验（`validateKey`），但 `/api/*` 没有。
+3. **`readBody` 没有大小上限** → 任何人 POST 一个超大 body 就能 OOM。
+   已加 `MAX_BODY`（默认 32MB），超限返回 413。
 
-推荐的加固方式 —— Nginx 反代 + Basic Auth：
+4. **SPA fallback 把 404 伪装成 200**（上次面板卡死的元凶）。现在带扩展名的
+   缺失资源老实返 404。
+
+5. **`console.log` 打印 API_KEY 明文** → 日志会进 `docker logs`。已删。
+
+6. **`recordKeyUsage` 每次请求同步全量写 `keys.json`** → 高 QPS 下 I/O 瓶颈
+   + 并发写损坏风险。已改成内存计数 + 5 秒节流落盘 + 退出前 flush。
+
+7. **`audit.jsonl` 只 append 从不轮转** → 长期跑写满磁盘。已加按大小轮转。
+
+8. **`gate-docker.ts` 有同样的问题**：`/api/*` 路由全排在鉴权门之前、
+   `readBody` 无上限、`/public/*` 路径穿越能读镜像源码。一并修了。
+
+9. **HTTP 超时**用的是 Node 默认（requestsTimeout 300s），已收紧并加
+   `maxConnections`。
+
+即便修完，仍建议 13339 不要裸奔公网 —— 前置 Nginx 加 IP 白名单或 Basic Auth：
 
   # /etc/nginx/conf.d/opencode-gate.conf
   server {
@@ -475,7 +536,29 @@ sing-box 自己怎么配是另一篇 topic，按你的订阅来。
   依赖      hpagent、socks-proxy-agent（npm ci --omit=dev）
   用户      非 root（USER node）
   健康检查  wget /ping | grep -q pong
-  默认环境  PORT=13339  DATA_DIR=/app/data  SINGBOX_MODE=off  API_KEY=admin123
+  默认环境  PORT=13339  DATA_DIR=/app/data  SINGBOX_MODE=off
+            MAX_BODY=32MB  AUDIT_MAX_BYTES=64MB  AUDIT_KEEP=5
+            MAX_CONNECTIONS=2048
+            ADMIN_TOKEN 不给默认值（不配 = /api/* 敞开）
+
+全部环境变量：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PORT` | `13339` | HTTP 端口 |
+| `ADMIN_TOKEN` | 空 | **配了就给 `/api/*` 加鉴权**。空 = 管理接口敞开 |
+| `DATA_DIR` | `/app/data` | 持久化目录 |
+| `MAX_BODY` | `33554432` | 请求体上限（32MB），超限返 413 |
+| `AUDIT_MAX_BYTES` | `67108864` | 审计日志单文件上限（64MB），超了轮转 |
+| `AUDIT_KEEP` | `5` | 保留几份轮转后的审计日志 |
+| `MAX_CONNECTIONS` | `2048` | 最大并发连接 |
+| `SINGBOX_MODE` | `off` | `on` 时走 sing-box 订阅节点 |
+| `SINGBOX_HOST` | `127.0.0.1` | sing-box 地址 |
+| `SINGBOX_HTTP_PORT` | `10800` | sing-box HTTP 入口 |
+| `SINGBOX_SOCKS_PORT` | `10801` | sing-box SOCKS5 入口 |
+| `SINGBOX_API_PORT` | `9090` | sing-box clash_api |
+| `ALLOW_PRIVATE_FETCH` | 关 | 置 `1` 才允许订阅 URL 指向内网 |
+| `API_KEY` | 无默认 | **不是鉴权凭据**，只为兼容旧配置 |
 
 镜像里有两个入口，默认跑 `gate.ts`（SingBox 版）：
 
@@ -486,5 +569,4 @@ sing-box 自己怎么配是另一篇 topic，按你的订阅来。
 
   docker run ... qq4756283/opencode-gate:latest npx tsx gate-docker.ts
 
-这两个版本的鉴权行为不一样（gate-docker.ts 有 401/403 校验），
-如果你的场景需要代理池调度而不是订阅节点，切过去再测一遍鉴权。
+两个版本的 `ADMIN_TOKEN` 鉴权行为现在一致了。
