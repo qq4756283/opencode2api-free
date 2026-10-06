@@ -1,4 +1,52 @@
-FROM opencode-gate:latest
-COPY gate.ts /app/gate.ts
-COPY public/ /app/public/
+# syntax=docker/dockerfile:1.7
+# ─────────────────────────────────────────────────────────────
+#  opencode-gate — standalone image
+#  入口 gate.ts 用 tsx 直接跑 TypeScript，不做编译步骤
+#  上游原 Dockerfile 是 `FROM opencode-gate:latest`，
+#  依赖本机手工构建的本地基础镜像 → CI 里必然 pull 失败，这里改成自包含。
+# ─────────────────────────────────────────────────────────────
+ARG NODE_IMAGE=node:22-alpine
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
+# ── deps: 只装生产依赖 ──────────────────────────────────────
+FROM ${NODE_IMAGE} AS deps
+ARG NPM_REGISTRY
+WORKDIR /app
+# npm 官方源在 CI 上偶发慢，给可覆盖的 registry；换回官方源：--build-arg NPM_REGISTRY=https://registry.npmjs.org
+RUN npm config set registry "${NPM_REGISTRY}"
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --no-audit --no-fund
+
+# ── runtime ────────────────────────────────────────────────
+FROM ${NODE_IMAGE} AS runtime
+ARG NPM_REGISTRY
+ENV NODE_ENV=production \
+    TZ=Asia/Shanghai \
+    NPM_REGISTRY=${NPM_REGISTRY} \
+    PORT=13339 \
+    DATA_DIR=/app/data \
+    SINGBOX_MODE=off \
+    API_KEY=admin123
+WORKDIR /app
+
+# tsx 作为 devDep 单独装到 runtime；node:22-alpine 自带 wget（busybox），HEALTHCHECK 直接用它
+RUN npm config set registry "${NPM_REGISTRY}" \
+ && npm install -g tsx --no-audit --no-fund \
+ && mkdir -p /app/data /app/public \
+ && chown -R node:node /app
+USER node
+
+COPY --from=deps --chown=node:node /app/node_modules ./node_modules
+COPY --chown=node:node package.json package-lock.json ./
+COPY --chown=node:node gate.ts ./gate.ts
+COPY --chown=node:node gate-docker.ts ./gate-docker.ts
+COPY --chown=node:node public/ ./public/
+
+EXPOSE 13339
+
+# /ping 由 gate.ts 的 handler 内部处理（见 Dockerfile 上方注释说明的历史崩溃 bug）
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD wget -qO- "http://127.0.0.1:${PORT}/ping" | grep -q pong || exit 1
+
 CMD ["npx", "tsx", "gate.ts"]

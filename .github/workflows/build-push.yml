@@ -1,0 +1,125 @@
+name: 'Build & Push (push/tag 自动触发)'
+
+# 本仓库自带的常驻构建流：不需要手动点 Actions，
+# push 到 main / 打 tag / 手动触发都会推 Docker Hub。
+# 需要"任意仓库代构建"时用 docker-hub.yml（Actions-buildUtils 兼容入口）。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - '**.md'
+      - 'daily_proxyip.py'
+      - 'proxyip_sub.txt'
+      - '500ip.txt'
+      - 'cfip_opencode_*.txt'
+      - 'scripts/**'
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: '构建平台'
+        required: false
+        default: linux/amd64,linux/arm64
+      push_image:
+        description: '是否推送（false = 只构建不推，用于验证 Dockerfile）'
+        type: boolean
+        required: false
+        default: true
+
+env:
+  IMAGE_NAME: opencode-gate
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: zcong1993/setup-timezone@master
+        with:
+          timezone: Asia/Shanghai
+
+      - name: Compute tags
+        id: meta
+        env:
+          USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
+          DISPATCH_PLATFORMS: ${{ inputs.platforms }}
+          DISPATCH_PUSH: ${{ inputs.push_image }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$USERNAME" ]; then
+            echo "::error::缺少 secret DOCKER_HUB_USERNAME"
+            exit 1
+          fi
+
+          IMAGE="$USERNAME/$IMAGE_NAME"
+          SHA="${GITHUB_SHA::7}"
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAGS="$IMAGE:${GITHUB_REF_NAME},$IMAGE:latest"
+          else
+            TAGS="$IMAGE:sha-$SHA,$IMAGE:latest"
+          fi
+
+          # workflow_dispatch 的 push_image=false → 只构建不推
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$DISPATCH_PUSH" = "false" ]; then
+            PUSH=false
+          else
+            PUSH=true
+          fi
+
+          {
+            echo "tags=$TAGS"
+            echo "push=$PUSH"
+            echo "platforms=${DISPATCH_PLATFORMS:-linux/amd64,linux/arm64}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "image  : $IMAGE"
+          echo "tags   : $TAGS"
+          echo "push   : $PUSH"
+
+      - name: Verify build context
+        run: |
+          set -euo pipefail
+          # 上游 .gitignore 里有 `public\*`；已跟踪文件不受影响，但这里硬校验，
+          # 缺文件就直接失败，避免构建出一个没有管理面板的坏镜像
+          for f in gate.ts package.json package-lock.json public/index.html public/app.js Dockerfile; do
+            [ -e "$f" ] || { echo "::error::缺少 $f"; exit 1; }
+          done
+          echo "上下文校验通过"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: ${{ steps.meta.outputs.push == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ steps.meta.outputs.push }}
+          platforms: ${{ steps.meta.outputs.platforms }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### 镜像构建完成"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "push: \`${{ steps.meta.outputs.push }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

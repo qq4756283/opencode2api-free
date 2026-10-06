@@ -1011,6 +1011,17 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
 
   try {
     // ───────────────────────────────────────────────
+    //  GET /ping  — 健康检查（Docker HEALTHCHECK 用）
+    //  必须在此处处理：曾用 server.on('request') 额外注册监听器，
+    //  导致 handler 已写完 404 后再 writeHead(200) 触发 ERR_HTTP_HEADERS_SENT 崩溃。
+    // ───────────────────────────────────────────────
+    if (pathname === '/ping') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('pong');
+      return;
+    }
+
+    // ───────────────────────────────────────────────
     //  GET /  — 状态页
     // ───────────────────────────────────────────────
     if (pathname === '/' && method === 'GET') {
@@ -1309,10 +1320,8 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
 
 const server = http.createServer(handler);
 
-server.on('request', (req, res) => {
-  // ping 健康检查
-  if (req.url === '/ping') { res.writeHead(200); res.end('pong'); return; }
-});
+// /ping 已在 handler 内部处理；不要再注册第二个 'request' 监听器，
+// 否则响应写完后再次 writeHead 会抛 ERR_HTTP_HEADERS_SENT 使进程崩溃。
 
 server.listen(PORT, '0.0.0.0', async () => {
   console.log(`\n[opencode-gate] SingBox 版启动`);

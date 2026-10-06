@@ -1,0 +1,190 @@
+name: '*构建镜像并推送至docker hub'
+
+# ─────────────────────────────────────────────────────────────
+#  与 qq4756283/Actions-buildUtils 的 docker-hub.yml 输入契约保持一致，
+#  这样同一个 Actions-buildUtils 实例既能构建本仓库，也能构建任意外部仓库：
+#    repoUrl       目标 git 仓库（可填上游 spfnas/opencode2api-free）
+#    dockerFileUrl 自定义 Dockerfile（必须覆盖默认的 Dockerfile）
+#  注意：上游 Dockerfile 是 `FROM opencode-gate:latest`，依赖本机手工构建的
+#  基础镜像，CI 里 pull 必然失败 → dockerFileUrl 一定要传本仓库的 raw 地址。
+# ─────────────────────────────────────────────────────────────
+
+on:
+  repository_dispatch:
+    types: [build-docker]
+  workflow_dispatch:
+    inputs:
+      repoUrl:
+        description: 'git仓库克隆url地址'
+        required: true
+        default: 'https://github.com/qq4756283/opencode2api-free.git'
+      imageName:
+        description: '构建镜像的名称,不填根据git地址自动生成'
+        required: false
+        default: 'opencode-gate'
+      repoBranch:
+        description: '指定git分支'
+        required: false
+        default: 'main'
+      dockerFileUrl:
+        description: '自定义DockerFile下载路径'
+        required: false
+        default: 'https://raw.githubusercontent.com/qq4756283/opencode2api-free/main/Dockerfile'
+      platforms:
+        description: '需要构建的平台'
+        required: false
+        default: linux/amd64,linux/arm64
+      tags:
+        description: '自定义dockerTags,多个用逗号分隔'
+        required: false
+        default: latest
+      timeTagsFormat:
+        description: '根据时间自动生成的dockerTag'
+        type: choice
+        default: 年-月-日_时-分-秒
+        options:
+          - 不生成时间tag
+          - 年-月-日_时-分-秒
+          - 年-月-日_时-分
+          - 月-日_时-分-秒
+          - 月-日_时-分
+      timeTagsPrefix:
+        description: '时间tag的前缀'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup timezone
+        uses: zcong1993/setup-timezone@master
+        with:
+          timezone: Asia/Shanghai
+
+      # ── 拉目标仓库并准备构建上下文 ──────────────────────
+      - name: Prepare context
+        id: ready
+        env:
+          REPO_URL: ${{ github.event.inputs.repoUrl || github.event.client_payload.repoUrl }}
+          REPO_BRANCH: ${{ github.event.inputs.repoBranch || github.event.client_payload.repoBranch }}
+          DOCKERFILE_URL: ${{ github.event.inputs.dockerFileUrl || github.event.client_payload.dockerFileUrl }}
+          IMAGE_NAME: ${{ github.event.inputs.imageName || github.event.client_payload.imageName }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "REPO_URL=$REPO_URL"      >> "$GITHUB_OUTPUT"
+          echo "REPO_BRANCH=$REPO_BRANCH" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$REPO_URL" ]; then
+            echo "::error::repoUrl 不能为空"
+            exit 1
+          fi
+
+          # 清空 checkout 出来的自身内容，再克隆目标仓库
+          rm -rf ./* ./.[!.]* ./..?* 2>/dev/null || true
+          if [ -n "$REPO_BRANCH" ]; then
+            git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" .
+          else
+            git clone --depth 1 "$REPO_URL" .
+          fi
+
+          if [ -n "$DOCKERFILE_URL" ]; then
+            wget -qO ./Dockerfile "$DOCKERFILE_URL"
+            echo "已使用自定义 Dockerfile: $DOCKERFILE_URL"
+          fi
+
+          # 上游 .gitignore 含 `public\*`，git clone 会带出已跟踪的 public/；
+          # 但保险起见校验一次，缺文件直接失败而不是构建出坏镜像
+          for f in gate.ts package.json package-lock.json public/index.html; do
+            if [ ! -e "$f" ]; then
+              echo "::error::构建上下文缺少 $f"
+              exit 1
+            fi
+          done
+
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::缺少 secrets.DOCKER_HUB_USERNAME / DOCKER_HUB_ACCESS_TOKEN"
+            exit 1
+          fi
+          echo "dockerHubUsername=$DOCKERHUB_USERNAME" >> "$GITHUB_OUTPUT"
+
+          NAME="${IMAGE_NAME:-$(basename "$REPO_URL" | cut -d? -f1 | tr '[:upper:]' '[:lower:]')}"
+          echo "imageName=$NAME" >> "$GITHUB_OUTPUT"
+          echo "镜像目标: $DOCKERHUB_USERNAME/$NAME"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ steps.ready.outputs.dockerHubUsername }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 组装 tag 列表 ──────────────────────────────────
+      - name: Resolve tags
+        id: tags
+        env:
+          USERNAME: ${{ steps.ready.outputs.dockerHubUsername }}
+          IMAGE: ${{ steps.ready.outputs.imageName }}
+          RAW_TAGS: ${{ github.event.inputs.tags || github.event.client_payload.tags }}
+          TIME_FORMAT: ${{ github.event.inputs.timeTagsFormat || github.event.client_payload.timeTagsFormat }}
+          TIME_PREFIX: ${{ github.event.inputs.timeTagsPrefix || github.event.client_payload.timeTagsPrefix }}
+        run: |
+          set -euo pipefail
+          IMAGE="$USERNAME/$IMAGE"
+          TAGS=""
+
+          if [ -n "$RAW_TAGS" ]; then
+            IFS=',' read -ra ARR <<< "$RAW_TAGS"
+            for t in "${ARR[@]}"; do
+              t="$(echo "$t" | xargs)"
+              # 允许直接写完整 tag（含 registry 前缀），否则视为 dockerhub tag
+              case "$t" in
+                */*) FULL="$t" ;;
+                *)   FULL="$IMAGE:$t" ;;
+              esac
+              TAGS="${TAGS:+$TAGS,}$FULL"
+            done
+          else
+            TAGS="$IMAGE:latest"
+          fi
+
+          case "$TIME_FORMAT" in
+            "年-月-日_时-分-秒") FMT="+%y-%m-%d_%H-%M-%S" ;;
+            "年-月-日_时-分")     FMT="+%y-%m-%d_%H-%M" ;;
+            "月-日_时-分-秒")     FMT="+%m-%d_%H-%M-%S" ;;
+            "月-日_时-分")         FMT="+%m-%d_%H-%M" ;;
+            *)                     FMT="" ;;
+          esac
+
+          if [ -n "$FMT" ]; then
+            TAGS="$TAGS,$IMAGE:${TIME_PREFIX}$(date "$FMT")"
+          fi
+
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "目标 tags: $TAGS"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        run: echo "${{ steps.build.outputs.digest }}"

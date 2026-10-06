@@ -1,0 +1,26 @@
+services:
+  # 本地构建版：docker compose -f docker-compose.build.yml up -d --build
+  opencode-gate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+    image: opencode-gate:local
+    container_name: opencode-gate
+    restart: always
+    ports:
+      - "13339:13339"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=13339
+      - API_KEY=${API_KEY:-admin123}
+      - DATA_DIR=/app/data
+      - SINGBOX_MODE=off
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:13339/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

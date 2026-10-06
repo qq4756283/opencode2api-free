@@ -1,0 +1,15 @@
+# Windows 默认 core.autocrlf=true 会把 LF 转成 CRLF。
+# Dockerfile 的 heredoc 和 Actions 的 shell 脚本一旦带 CRLF 就会挂，
+# 所以显式钉死行尾。
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+*.dockerfile    text eol=lf
+.dockerignore   text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.sh            text eol=lf
+*.ts            text eol=lf
+
+# PowerShell 在 Windows 上用 CRLF 更合适
+*.ps1           text eol=crlf
+*.py            text eol=lf
