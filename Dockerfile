@@ -40,17 +40,25 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 # tsx 作为 devDep 单独装到 runtime；node:22-alpine 自带 wget（busybox），HEALTHCHECK 直接用它
+# su-exec 用于 entrypoint 里 root→node 降权（alpine 官方包，很小）
 RUN npm config set registry "${NPM_REGISTRY}" \
  && npm install -g tsx --no-audit --no-fund \
- && mkdir -p /app/data /app/public \
+ && apk add --no-cache su-exec \
+ && mkdir -p /app/data /app/public /app/singbox \
  && chown -R node:node /app
-USER node
+# 注意：这里不写 USER node。
+# 挂了宿主目录时目录属主通常是 root，写死 USER node 会导致
+#   ❌ [Key] 保存失败: EACCES: permission denied, open '/app/data/keys.json'
+# 面板改配置「成功」但不落盘，刷新就回去。
+# 改由 entrypoint 以 root 启动 → 修正挂载目录属主 → su-exec 降权到 node 执行。
+# 见 docker-entrypoint.sh
 
 COPY --from=deps --chown=node:node /app/node_modules ./node_modules
 COPY --chown=node:node package.json package-lock.json ./
 COPY --chown=node:node gate.ts ./gate.ts
 COPY --chown=node:node gate-docker.ts ./gate-docker.ts
 COPY --chown=node:node public/ ./public/
+COPY --chown=root:root --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 13339
 
@@ -58,4 +66,5 @@ EXPOSE 13339
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD wget -qO- "http://127.0.0.1:${PORT}/ping" | grep -q pong || exit 1
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["npx", "tsx", "gate.ts"]

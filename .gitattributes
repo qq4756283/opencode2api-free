@@ -8,6 +8,7 @@ Dockerfile.*    text eol=lf
 *.yml           text eol=lf
 *.yaml          text eol=lf
 *.sh            text eol=lf
+docker-entrypoint.sh text eol=lf
 *.ts            text eol=lf
 
 # PowerShell 在 Windows 上用 CRLF 更合适

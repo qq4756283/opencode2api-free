@@ -72,9 +72,6 @@ generate 一串：
 
   mkdir -p /opt/opencode-gate/data
 
-不建的话 Docker 会自己创建一个 root 属主的目录，
-容器内非 root 的 `node` 用户写不进去。
-
 ### 2. 启动
 
   ADMIN_TOKEN=$(openssl rand -hex 32) && echo "你的 ADMIN_TOKEN：$ADMIN_TOKEN" && \
@@ -494,6 +491,38 @@ keys.json 存的是明文 key，备份文件注意权限（chmod 600）。
 
   docker logs --tail 100 opencode-gate
 
+### 面板改配置「显示成功」但刷新就回去
+
+看日志有没有这行：
+
+  ❌ [Key] 保存失败: EACCES: permission denied, open '/app/data/keys.json'
+
+有就是这个原因：**挂载目录属主不对，容器写不进去**。
+接口返回的是内存里的值，所以看着"成功"，其实没落盘。
+
+新镜像自带 entrypoint 会自动修（启动时以 root 进容器 →
+修正目录属主 → 降权到 node 执行）。先确认你有没有新镜像：
+
+  docker exec opencode-gate sh -c 'id -u'        # 应输出 1000（node），不是 0
+  docker exec opencode-gate ls -la /usr/local/bin/docker-entrypoint.sh 2>&1
+
+报 "No such file" 或 `id -u` 输出 0 → 还是旧镜像，先拉新的：
+
+  docker pull qq4756283/opencode-gate:latest
+
+**旧镜像的临时修法**（不想重建的话）：
+
+  # node 官方镜像里 node = uid 1000, gid 1000
+  chown -R 1000:1000 /opt/opencode-gate/data
+  ls -ld /opt/opencode-gate/data          # 应显示 1000 1000
+  docker restart opencode-gate
+  docker logs --tail 20 opencode-gate     # 不应再有 EACCES
+
+如果 `chown` 报 `Operation not permitted`，说明你在容器内或者
+文件系统不支持改属主（NFS/CIFS 常见挂载），那就只能在宿主上用
+root 执行，或者把 data 目录放进容器内部（去掉 `-v` 挂载，
+数据随容器一起，容器重建会丢）。
+
 ### healthy 但请求 502 / 超时
 
 先直连容器确认服务本身是好的：
@@ -511,12 +540,22 @@ Nginx 缓冲没关。必须：
 
 ### 401
 
-key 不在 keys.json 里，或者被禁用 / 过期 / 超并发超次数。
-先查：
+两种可能，看返回体区分：
 
-  curl http://127.0.0.1:13339/api/keys
+**`{"error":{"message":"key 不存在"}}` 之类** —— `/v1/*` 的 key 校验没过。
+key 不在 keys.json 里，或者被禁用 / 过期 / 超并发超次数。
+
+  curl http://127.0.0.1:13339/api/keys -H "X-Admin-Token: $ADMIN_TOKEN"
 
 注意 key 是区分大小写的精确匹配。
+
+**`{"error":{"message":"需要管理权限..."}}`** —— `/api/*` 的 ADMIN_TOKEN 没带或带错。
+
+  curl http://127.0.0.1:13339/api/keys -H "X-Admin-Token: $ADMIN_TOKEN"
+
+顺带一提：如果上游 opencode.ai 自己也返回 401（比如模型名不对），
+网关会原样把状态码透传，看着像 key 问题，其实是模型名问题。
+看返回体的 `error.type` 字段：`ModelError` 就是上游在拒绝模型。
 
 ### /v1/models 返回空
 

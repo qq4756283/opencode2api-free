@@ -13,6 +13,9 @@ singbox
 *.tar
 .DS_Store
 
+# entrypoint 需要进镜像，别被 ignore 掉
+!docker-entrypoint.sh
+
 # 代理 IP 列表是 daily_proxyip.py 的输出，镜像运行时用不到
 500ip.txt
 cfip_opencode_formatted.txt
