@@ -5,7 +5,8 @@ opencode-gate 远程服务器部署教程
   镜像      qq4756283/opencode-gate:latest
   大小      69.5 MB
   端口      13339
-  当前版本  sha256:4535d924ea53b72b91b28758d33a7f021dd25b4d3475c50e2b0e4662de701b79
+  当前版本  sha256:2874bfaeb2adfac5169b73d9156d377cb9762742599d1c37ee3abd2d34dab0fd
+            （含 entrypoint 自动修挂载目录属主；比这早的版本会 EACCES）
 
 
 ────────────────────────────────────────────────────────────
