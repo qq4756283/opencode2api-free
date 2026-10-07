@@ -5,6 +5,33 @@ opencode-gate 远程服务器部署教程
   镜像      qq4756283/opencode-gate:latest
   大小      69.5 MB
   端口      13339
+  当前版本  sha256:4535d924ea53b72b91b28758d33a7f021dd25b4d3475c50e2b0e4662de701b79
+
+
+────────────────────────────────────────────────────────────
+TL;DR — 三步跑起来
+────────────────────────────────────────────────────────────
+
+  # 1. 数据目录
+  mkdir -p /opt/opencode-gate/data
+
+  # 2. 启动（token 会打印出来，记一下）
+  ADMIN_TOKEN=$(openssl rand -hex 32) && echo "ADMIN_TOKEN=$ADMIN_TOKEN" && \
+  docker run -d \
+    --name opencode-gate \
+    --restart always \
+    -p 13339:13339 \
+    -v /opt/opencode-gate/data:/app/data \
+    -e ADMIN_TOKEN="$ADMIN_TOKEN" \
+    qq4756283/opencode-gate:latest
+
+  # 3. 验证
+  docker ps                                                     # healthy
+  curl http://127.0.0.1:13339/ping                             # pong
+  curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:13339/api/keys   # 401
+  curl -s http://127.0.0.1:13339/v1/models -H 'Authorization: Bearer sk-default'
+
+细节在第一节；正式部署用 compose 见第二节；安全说明见第六节。
 
 
 ────────────────────────────────────────────────────────────
@@ -22,47 +49,92 @@ generate 一串：
 
   openssl rand -hex 32
 
-写进 .env 的 ADMIN_TOKEN= 那一行，之后所有管理操作都要带它。
-
-⚠ 这套鉴权是本轮审计新加的。**旧镜像没有这个能力**，
-   你现在线上的容器如果还是旧 digest，管理接口仍然是敞开的。
-   升级镜像 + 配 ADMIN_TOKEN 两件事都做才算修好。
-
-面板会自动处理：第一次 401 时弹框要 token，输一次记住
-（存 localStorage）。
-
 **两套 key 别搞混：**
 
   ADMIN_TOKEN   管 /api/*  管理、面板、改配置
   sk-default    管 /v1/*   实际转发模型请求
+
+⚠ 这套鉴权是审计后新加的。**旧镜像没有这个能力**，
+   线上容器如果还是旧 digest，管理接口仍然是敞开的。
+   升级镜像 + 配 ADMIN_TOKEN 两件事都做才算修好。
+
+面板会自动处理：第一次 401 时弹框要 token，输一次记住
+（存 localStorage）。
 
 
 ─────────────────────────────────────────────────────────────
 一、最快路径：一条 docker run
 ─────────────────────────────────────────────────────────────
 
-适合先跑起来看看能不能用。
+适合先跑起来看看能不能用。三步，复制粘贴即可。
 
+### 1. 建数据目录
+
+  mkdir -p /opt/opencode-gate/data
+
+不建的话 Docker 会自己创建一个 root 属主的目录，
+容器内非 root 的 `node` 用户写不进去。
+
+### 2. 启动
+
+  ADMIN_TOKEN=$(openssl rand -hex 32) && echo "你的 ADMIN_TOKEN：$ADMIN_TOKEN" && \
   docker run -d \
     --name opencode-gate \
     --restart always \
     -p 13339:13339 \
     -v /opt/opencode-gate/data:/app/data \
-    -e ADMIN_TOKEN="$(openssl rand -hex 32)" \
+    -e ADMIN_TOKEN="$ADMIN_TOKEN" \
     qq4756283/opencode-gate:latest
 
-  # 忘了 token 就从容器环境里捞回来
-  docker inspect opencode-gate --format '{{range .Config.Env}}{{println .}}{{end}}' | grep ADMIN_TOKEN
+`echo` 那步别省 —— token 只打印一次，丢了只能从容器里捞。
 
-验证：
+### 3. 验证
 
-  docker ps                                   # STATUS 应为 healthy
-  curl http://127.0.0.1:13339/ping           # pong
-  curl http://127.0.0.1:13339/status         # JSON 状态
-  curl http://127.0.0.1:13339/v1/models \
-    -H 'Authorization: Bearer sk-default'     # 模型列表
+  docker ps                                    # STATUS 应为 healthy
+
+  curl http://127.0.0.1:13339/ping            # pong
+
+  # 没带 token → 401（说明鉴权生效）
+  curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:13339/api/keys
+
+  # 带 token → 200
+  curl -s http://127.0.0.1:13339/api/keys \
+    -H "X-Admin-Token: $ADMIN_TOKEN" | head -c 200
+
+  # 模型调用用 sk-default，不是 ADMIN_TOKEN
+  curl -s http://127.0.0.1:13339/v1/models \
+    -H "Authorization: Bearer sk-default"
 
 管理面板在 http://<服务器IP>:13339/ ，浏览器打开后输一次 ADMIN_TOKEN。
+
+### token 丢了 / 想固定 token
+
+从容器环境捞回来：
+
+  docker inspect opencode-gate \
+    --format '{{range .Config.Env}}{{println .}}{{end}}' | grep ADMIN_TOKEN
+
+固定下来（推荐，重装容器不用重新生成）：
+
+  mkdir -p /opt/opencode-gate && cd /opt/opencode-gate
+  echo "ADMIN_TOKEN=$(openssl rand -hex 32)" > .env
+  chmod 600 .env && cat .env
+
+之后启动时引用：
+
+  docker rm -f opencode-gate
+  docker run -d --name opencode-gate --restart always \
+    -p 13339:13339 \
+    -v /opt/opencode-gate/data:/app/data \
+    -e ADMIN_TOKEN=$(grep ADMIN_TOKEN /opt/opencode-gate/.env | cut -d= -f2) \
+    qq4756283/opencode-gate:latest
+
+### 两个坑
+
+- `$ADMIN_TOKEN` 是当前 shell 的临时变量，**重开终端就没了**。
+  后面那些 curl 要么在同一会话里跑，要么重新从 `.env` 读。
+- `sk-default` 是公开的默认调用 key。放公网的话建议在面板
+  「密钥管理」里建一个自己的 key，把 `sk-default` 禁用或删掉。
 
 
 ─────────────────────────────────────────────────────────────
@@ -385,12 +457,15 @@ data 目录是 volume 挂载的，升级不影响 keys.json 和审计日志。
 ### 回滚
 
   docker compose down
-  # 上一版镜像
   docker run -d --name opencode-gate --restart always \
     -p 13339:13339 \
     -v /opt/opencode-gate/data:/app/data \
-    -e API_KEY=sk-default \
+    -e ADMIN_TOKEN=$(grep ADMIN_TOKEN /opt/opencode-gate/.env | cut -d= -f2) \
     qq4756283/opencode-gate@sha256:<旧 digest>
+
+⚠ 回滚到本轮审计**之前**的 digest 等于把漏洞装回去（/api/* 无鉴权、
+SSRF、无 body 上限）。要回滚请只回滚业务代码层面的问题，别退回
+`c93ffaf3`（2026-10-06 18:29 那版）或更早。
 
 ### 日志
 
